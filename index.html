@@ -334,7 +334,7 @@ function defaultState(){
     people:[{id:ownerId,name:'Você',color:'#6c8cff',isOwner:true}],
     incomes:[],   // {id,name,amount,month,recurring}
     bills:[],     // ver schema em openBillModal
-    sync:{url:'',anonKey:'',vaultId:'',enabled:false,lastSync:0},
+    sync:{provider:'google',url:'',anonKey:'',gscriptUrl:'',vaultId:'',enabled:false,lastSync:0},
   };
 }
 function ownerId(){const o=state.people.find(p=>p.isOwner);return o?o.id:null;}
@@ -363,9 +363,15 @@ function setSyncStatus(s){
   else if(s==='error'){txt.textContent='Erro de sync';}
 }
 
-/* ---------- SYNC NA NUVEM (Supabase REST) ---------- */
+/* ---------- SYNC NA NUVEM (dispatcher) ---------- */
+function stripForCloud(){const c=JSON.parse(JSON.stringify(state));delete c.sync;delete c.auth;return c;}
+function applyRemote(remote){remote.sync=state.sync;remote.auth=state.auth;state=remote;persistLocal();setSyncStatus('synced');}
+async function cloudPush(){return (state.sync.provider==='google')?gsPush():sbPush();}
+async function cloudPull(){return (state.sync.provider==='google')?gsPull():sbPull();}
+
+/* ---------- Supabase ---------- */
 function sbHeaders(){return{'apikey':state.sync.anonKey,'Authorization':'Bearer '+state.sync.anonKey,'Content-Type':'application/json'};}
-async function cloudPush(){
+async function sbPush(){
   try{
     const body=[{id:state.sync.vaultId,data:JSON.stringify(stripForCloud()),updated_at:new Date().toISOString()}];
     const r=await fetch(state.sync.url.replace(/\/$/,'')+'/rest/v1/vaults',{method:'POST',headers:{...sbHeaders(),'Prefer':'resolution=merge-duplicates'},body:JSON.stringify(body)});
@@ -373,22 +379,39 @@ async function cloudPush(){
     state.sync.lastSync=Date.now();persistLocal();setSyncStatus('synced');
   }catch(e){console.warn('push',e);setSyncStatus('error');}
 }
-async function cloudPull(){
+async function sbPull(){
   try{
     const u=state.sync.url.replace(/\/$/,'')+'/rest/v1/vaults?id=eq.'+encodeURIComponent(state.sync.vaultId)+'&select=data';
     const r=await fetch(u,{headers:sbHeaders()});
     if(!r.ok)throw new Error(await r.text());
     const rows=await r.json();
-    if(rows&&rows[0]&&rows[0].data){
-      const remote=JSON.parse(rows[0].data);
-      // mantém credenciais locais de sync e auth
-      remote.sync=state.sync;remote.auth=state.auth;
-      state=remote;persistLocal();setSyncStatus('synced');return true;
-    }
+    if(rows&&rows[0]&&rows[0].data){applyRemote(JSON.parse(rows[0].data));return true;}
     return false;
   }catch(e){console.warn('pull',e);setSyncStatus('error');return false;}
 }
-function stripForCloud(){const c=JSON.parse(JSON.stringify(state));delete c.sync;delete c.auth;return c;}
+
+/* ---------- Google Sheets (Apps Script Web App) ----------
+   POST em text/plain (evita preflight CORS); GET para leitura. */
+async function gsPush(){
+  try{
+    const payload=JSON.stringify({vault:state.sync.vaultId,data:JSON.stringify(stripForCloud())});
+    const r=await fetch(state.sync.gscriptUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:payload});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    if(!j||!j.ok)throw new Error(j&&j.error?j.error:'resposta inválida');
+    state.sync.lastSync=Date.now();persistLocal();setSyncStatus('synced');
+  }catch(e){console.warn('gsPush',e);setSyncStatus('error');}
+}
+async function gsPull(){
+  try{
+    const u=state.sync.gscriptUrl+(state.sync.gscriptUrl.includes('?')?'&':'?')+'vault='+encodeURIComponent(state.sync.vaultId);
+    const r=await fetch(u);
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    if(j&&j.ok&&j.data){applyRemote(JSON.parse(j.data));return true;}
+    return false;
+  }catch(e){console.warn('gsPull',e);setSyncStatus('error');return false;}
+}
 
 /* ---------- MOTOR FINANCEIRO ---------- */
 // valor base de uma conta num mês (antes de divisão)
@@ -803,13 +826,20 @@ function renderSettings(el){
       <div class="card">
         <h3 class="sect"><span class="sect-ic" style="background:#38e6c522;color:#38e6c5">${svgIco('cloud')}</span>Sincronização na nuvem</h3>
         <div class="sect-sub">Acesse de qualquer computador com os dados sempre atualizados</div>
-        <div class="field"><label>URL do projeto Supabase</label><input id="sy-url" placeholder="https://xxxx.supabase.co" value="${esc(sy.url)}"></div>
-        <div class="field"><label>Chave pública (anon key)</label><input id="sy-key" placeholder="eyJhbGci..." value="${esc(sy.anonKey)}"></div>
+        <div class="seg" id="sy-prov" style="margin-bottom:16px">
+          <button data-p="google">Google Sheets</button>
+          <button data-p="supabase">Supabase</button>
+        </div>
+        <div id="sy-google" ${sy.provider==='supabase'?'class="hidden"':''}>
+          <div class="field"><label>URL do app Google (Apps Script)</label><input id="sy-gurl" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(sy.gscriptUrl)}"></div>
+        </div>
+        <div id="sy-supa" ${sy.provider==='supabase'?'':'class="hidden"'}>
+          <div class="field"><label>URL do projeto Supabase</label><input id="sy-url" placeholder="https://xxxx.supabase.co" value="${esc(sy.url)}"></div>
+          <div class="field"><label>Chave pública (anon/publishable)</label><input id="sy-key" placeholder="eyJhbGci... ou sb_publishable_..." value="${esc(sy.anonKey)}"></div>
+        </div>
         <div class="field"><label>ID do cofre (sua palavra-secreta)</label><input id="sy-vault" placeholder="ex: adriano-2026-x9k" value="${esc(sy.vaultId)}"></div>
         <div style="display:flex;gap:10px"><button class="btn sm" onclick="enableSync()">${svgIco('cloud')}Ativar & enviar</button><button class="btn ghost sm" onclick="pullSync()">Baixar da nuvem</button></div>
-        <details class="acc"><summary>Como configurar a nuvem (passo a passo)<span>＋</span></summary><div class="body">É grátis e leva ~3 min. Crie um projeto em <span class="help-link" onclick="window.open('https://supabase.com','_blank')">supabase.com</span>, depois no SQL Editor rode:<div class="preview-months" style="font-family:monospace;white-space:pre-wrap">create table vaults (id text primary key, data jsonb, updated_at timestamptz);
-alter table vaults enable row level security;
-create policy anon_all on vaults for all to anon using (true) with check (true);</div>Em <b>Settings → API</b> copie a <b>URL</b> e a <b>anon key</b>, cole acima, invente um ID de cofre e clique em Ativar.</div></details>
+        <details class="acc"><summary>Como configurar (passo a passo)<span>＋</span></summary><div class="body"><b>Google Sheets (recomendado — nunca pausa):</b> crie uma planilha em <span class="help-link" onclick="window.open('https://sheets.new','_blank')">sheets.new</span>, vá em <b>Extensões → Apps Script</b>, cole o código que o Aurora forneceu, clique em <b>Implantar → Nova implantação → App da Web</b> (Executar como: eu / Acesso: qualquer pessoa), copie a <b>URL /exec</b> e cole acima.<br><br><b>Supabase:</b> crie um projeto em <span class="help-link" onclick="window.open('https://supabase.com','_blank')">supabase.com</span>, no SQL Editor rode <code>create table vaults ...</code> com a policy anon, e cole URL + chave.</div></details>
       </div>
       <div class="card">
         <h3 class="sect"><span class="sect-ic" style="background:#ffcf5c22;color:#ffcf5c">${svgIco('lock')}</span>Conta & segurança</h3>
@@ -828,6 +858,15 @@ create policy anon_all on vaults for all to anon using (true) with check (true);
         </div>
       </div>
     </div>`;
+  // seletor de provedor de nuvem
+  const setProv=p=>{
+    state.sync.provider=p;
+    $$('#sy-prov button').forEach(b=>b.classList.toggle('on',b.dataset.p===p));
+    $('#sy-google').classList.toggle('hidden',p!=='google');
+    $('#sy-supa').classList.toggle('hidden',p!=='supabase');
+  };
+  $$('#sy-prov button').forEach(b=>b.onclick=()=>setProv(b.dataset.p));
+  setProv(sy.provider||'google');
 }
 
 /* ---------- HELPERS UI ---------- */
@@ -1048,8 +1087,20 @@ function delIncome(id){state.incomes=state.incomes.filter(i=>i.id!==id);schedule
 /* ===================== SETTINGS ACTIONS ===================== */
 function saveSettings(){state.settings.startMonth=$('#set-start').value||state.settings.startMonth;state.settings.horizon=clamp(parseInt($('#set-horizon').value)||24,6,60);state.settings.reserveCurrent=Number($('#set-reserve').value)||0;state.settings.reserveTargetMonths=clamp(parseInt($('#set-resmonths').value)||6,3,12);CUR=clampToHorizon(CUR);scheduleSave();toast('Preferências salvas');render();}
 async function saveAccount(){const u=$('#ac-user').value.trim();if(u)state.auth.user=u;const p=$('#ac-pass').value;if(p){state.auth.salt=uid();state.auth.hash=await sha256(p+state.auth.salt);}scheduleSave();toast('Credenciais atualizadas');}
-async function enableSync(){state.sync.url=$('#sy-url').value.trim();state.sync.anonKey=$('#sy-key').value.trim();state.sync.vaultId=$('#sy-vault').value.trim();if(!state.sync.url||!state.sync.anonKey||!state.sync.vaultId){toast('Preencha URL, chave e ID do cofre.','err');return;}state.sync.enabled=true;toast('Conectando à nuvem…','info');await cloudPush();if(state.sync.lastSync)toast('Nuvem ativada e dados enviados!');render();}
-async function pullSync(){state.sync.url=$('#sy-url').value.trim();state.sync.anonKey=$('#sy-key').value.trim();state.sync.vaultId=$('#sy-vault').value.trim();if(!state.sync.url||!state.sync.anonKey||!state.sync.vaultId){toast('Preencha os dados da nuvem.','err');return;}state.sync.enabled=true;toast('Baixando da nuvem…','info');const ok=await cloudPull();if(ok){toast('Dados carregados da nuvem!');render();}else toast('Nada encontrado nesse cofre ainda.','err');}
+function readSyncInputs(){
+  const g=$('#sy-gurl'),u=$('#sy-url'),k=$('#sy-key');
+  if(g)state.sync.gscriptUrl=g.value.trim();
+  if(u)state.sync.url=u.value.trim();
+  if(k)state.sync.anonKey=k.value.trim();
+  state.sync.vaultId=$('#sy-vault').value.trim();
+}
+function syncConfigOk(){
+  if(!state.sync.vaultId)return false;
+  if(state.sync.provider==='google')return !!state.sync.gscriptUrl;
+  return !!(state.sync.url&&state.sync.anonKey);
+}
+async function enableSync(){readSyncInputs();if(!syncConfigOk()){toast('Preencha os campos da nuvem e o ID do cofre.','err');return;}state.sync.enabled=true;toast('Conectando à nuvem…','info');await cloudPush();if(state.sync.lastSync)toast('Nuvem ativada e dados enviados!');else toast('Não consegui enviar — confira a URL/chave.','err');render();}
+async function pullSync(){readSyncInputs();if(!syncConfigOk()){toast('Preencha os campos da nuvem e o ID do cofre.','err');return;}state.sync.enabled=true;toast('Baixando da nuvem…','info');const ok=await cloudPull();if(ok){toast('Dados carregados da nuvem!');render();}else toast('Nada encontrado nesse cofre ainda.','err');}
 function exportData(){const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='aurora-financas-'+todayKey()+'.json';a.click();toast('Backup exportado');}
 function importData(e){const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);if(!d.bills||!d.people)throw 0;state=d;persistLocal();toast('Dados importados');render();}catch(err){toast('Arquivo inválido.','err');}};r.readAsText(f);}
 function wipeData(){if(!confirm('Apagar TODOS os dados deste dispositivo? (a nuvem não é afetada)'))return;localStorage.removeItem(STORE_KEY);location.reload();}
@@ -1070,7 +1121,9 @@ function logout(){sessionStorage.removeItem('aurora_auth');location.reload();}
 async function boot(){
   const loaded=loadLocal();
   state=loaded||defaultState();
-  if(!state.sync)state.sync={url:'',anonKey:'',vaultId:'',enabled:false,lastSync:0};
+  if(!state.sync)state.sync={provider:'google',url:'',anonKey:'',gscriptUrl:'',vaultId:'',enabled:false,lastSync:0};
+  if(!state.sync.provider)state.sync.provider=state.sync.url?'supabase':'google';
+  if(state.sync.gscriptUrl===undefined)state.sync.gscriptUrl='';
   if(!state.auth)state.auth={user:'adriano',hash:'',salt:''};
   if(!state.auth.hash){state.auth.salt=uid();state.auth.hash=await sha256('aurora2026'+state.auth.salt);persistLocal();}
   if(!state.settings.startMonth)state.settings.startMonth=mkKey(new Date().getFullYear(),0);
